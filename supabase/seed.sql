@@ -1,4 +1,8 @@
--- Seed data generated from src/data/defaultData.ts. Attendance intentionally starts empty.
+-- DEVELOPMENT/EXAMPLE DATA ONLY.
+-- This fixture was generated from the original AI Studio prototype and is NOT
+-- the authoritative FALAH 2026 roster or venue configuration.
+-- Never run this file against the live project absensi-falah-2026.
+-- Attendance intentionally starts empty.
 insert into public.events (id,name,venue_name,timezone,status) values ('00000000-0000-0000-0000-000000000001','Kepanitiaan Falah Akbar 2026','Kampus B Universitas Airlangga','Asia/Jakarta','active');
 insert into public.divisions (id,event_id,name,sort_order,is_active) values ('00000000-0000-0000-0000-000000001001','00000000-0000-0000-0000-000000000001','Badan Pengurus Harian (BPH)',1,true);
 insert into public.divisions (id,event_id,name,sort_order,is_active) values ('00000000-0000-0000-0000-000000001002','00000000-0000-0000-0000-000000000001','Sie Acara & Protokoler',2,true);
@@ -118,4 +122,3 @@ insert into public.committee_members (event_id,division_id,public_code,name,role
 insert into public.committee_members (event_id,division_id,public_code,name,role,phone,is_active) values ('00000000-0000-0000-0000-000000000001','00000000-0000-0000-0000-000000001009','FLH-100','Vicky Shu','Anggota','081210000099',true);
 
 -- No attendance_records are seeded for the initial foundation.
-
