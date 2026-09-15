@@ -1,0 +1,10 @@
+project_id = "falah-2026"
+
+[api]
+enabled = true
+
+[db]
+major_version = 15
+
+[studio]
+enabled = true
