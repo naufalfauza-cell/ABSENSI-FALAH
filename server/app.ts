@@ -1,8 +1,8 @@
 import express from 'express';
 import path from 'path';
 import fs from 'fs';
-import { DEFAULT_SETTINGS, DEFAULT_LOCATIONS, DEFAULT_SESSIONS, generateInitialMembers } from '../src/data/defaultData';
-import { AttendanceRecord, AppSettings, CommitteeMember, LocationTarget, EventSession } from '../src/types';
+import { DEFAULT_SETTINGS, DEFAULT_LOCATIONS, DEFAULT_SESSIONS, generateInitialMembers } from '../src/data/defaultData.js';
+import type { AttendanceRecord, AppSettings, CommitteeMember, LocationTarget, EventSession } from '../src/types.js';
 
 const app = express();
 
@@ -342,4 +342,3 @@ app.post('/api/reset-data', (req, res) => {
 });
 
 export default app;
-

@@ -1,4 +1,4 @@
-import { AppSettings, CommitteeMember, LocationTarget, EventSession } from '../types';
+import type { AppSettings, CommitteeMember, LocationTarget, EventSession } from '../types.js';
 
 export const DEFAULT_SESSIONS: EventSession[] = [
   {
