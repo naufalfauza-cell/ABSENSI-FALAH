@@ -36,17 +36,33 @@ const safeAttendance = (r: Record<string, unknown> | null, session?: Record<stri
 app.get('/api/health', (_req, res) => res.json({ status: 'ok', database: !!supabaseAdmin, service: 'falah-attendance-api', time: new Date().toISOString() }));
 
 app.get('/api/public/bootstrap', async (_req, res) => {
+  let stage = 'configuration';
   try {
     const db = requireSupabaseAdmin();
+    stage = 'events';
     const event = await getActiveEvent();
     if (!event) return fail(res, 503, 'Event aktif belum dikonfigurasi');
     const [{ data: divisions, error: dError }, { data: sessions, error: sError }] = await Promise.all([
       db.from('divisions').select('id,name,sort_order').eq('event_id', event.id).eq('is_active', true).order('sort_order'),
       db.from('event_sessions').select(sessionFields).eq('event_id', event.id).eq('is_active', true).order('session_number'),
     ]);
-    if (dError) throw dError; if (sError) throw sError;
+    if (dError) { stage = 'divisions'; throw dError; }
+    if (sError) { stage = 'event_sessions'; throw sError; }
     return res.json({ event: { id: event.id, name: event.name, venueName: event.venue_name, timezone: event.timezone }, divisions: (divisions ?? []).map((d) => ({ id: d.id, name: d.name })), sessions: (sessions ?? []).map(safeSession) });
-  } catch (error) { return res.status(503).json({ error: errorText(error) }); }
+  } catch (error) {
+    const fault = error as { code?: unknown; message?: unknown } | null;
+    let message = typeof fault?.message === 'string' ? fault.message : 'Unknown server error';
+    for (const secret of [process.env.SUPABASE_SERVICE_ROLE_KEY, process.env.SUPABASE_URL, process.env.VITE_SUPABASE_URL]) {
+      if (secret) message = message.split(secret).join('[redacted]');
+    }
+    message = message.replace(/https?:\/\/\S+|Bearer\s+\S+|eyJ[\w.-]+|sb_secret_[\w-]+/gi, '[redacted]');
+    console.error('[FALAH bootstrap]', {
+      stage, code: typeof fault?.code === 'string' && /^[A-Z0-9_]{1,32}$/.test(fault.code) ? fault.code : undefined,
+      message: message.slice(0, 500),
+      configuration: { urlPresent: !!(process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL), serviceRoleKeyPresent: !!process.env.SUPABASE_SERVICE_ROLE_KEY },
+    });
+    return res.status(503).json({ error: 'Gagal memuat data FALAH. Silakan muat ulang halaman.' });
+  }
 });
 
 app.get('/api/public/members', async (req, res) => {

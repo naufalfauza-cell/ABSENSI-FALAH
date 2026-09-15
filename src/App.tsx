@@ -2,19 +2,13 @@ import { useEffect, useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
 import { Check, ChevronLeft, ChevronRight, Clock3, MapPin, RefreshCw, ShieldCheck, Users } from 'lucide-react';
 import type { GPSPosition, OperationalState, PublicAttendance, PublicDivision, PublicMember, PublicSession } from './types.js';
+import { api, bootstrapFailure } from './lib/api.js';
 
 type Screen = 'splash' | 'division' | 'member' | 'session' | 'attendance';
 type Bootstrap = { event: { id: string; name: string; venueName: string; timezone: string }; divisions: PublicDivision[]; sessions: PublicSession[] };
 
 const stateLabel: Record<OperationalState, string> = { closed: 'Ditutup', checkin_open: 'Check-in dibuka', checkout_open: 'Check-out dibuka', completed: 'Selesai' };
 const stateColor: Record<OperationalState, string> = { closed: 'bg-slate-100 text-slate-500', checkin_open: 'bg-emerald-100 text-emerald-700', checkout_open: 'bg-amber-100 text-amber-700', completed: 'bg-indigo-100 text-indigo-700' };
-
-async function api<T>(url: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...options });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error || 'Permintaan gagal');
-  return data;
-}
 
 function Header({ onBack, onChange }: { onBack?: () => void; onChange?: () => void }) {
   return <header className="flex items-center justify-between px-5 py-4 text-white">
@@ -41,7 +35,17 @@ function App() {
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
 
-  useEffect(() => { api<Bootstrap>('/api/public/bootstrap').then(setBootstrap).catch((e) => setError(e.message)); const timer = window.setTimeout(() => setScreen('division'), 700); return () => window.clearTimeout(timer); }, []);
+  useEffect(() => {
+    api<Bootstrap>('/api/public/bootstrap').then((data) => {
+      if (!data.event || !Array.isArray(data.divisions) || !Array.isArray(data.sessions)) {
+        console.error('[FALAH bootstrap]', { reason: 'invalid_payload' });
+        throw new Error(bootstrapFailure);
+      }
+      setBootstrap(data);
+    }).catch(() => setError(bootstrapFailure));
+    const timer = window.setTimeout(() => setScreen('division'), 700);
+    return () => window.clearTimeout(timer);
+  }, []);
   const selectedAttendance = useMemo(() => attendance, [attendance]);
 
   const chooseDivision = async (item: PublicDivision) => { setError(''); setDivision(item); setLoading(true); try { const data = await api<{ members: PublicMember[] }>(`/api/public/members?divisionId=${encodeURIComponent(item.id)}`); setMembers(data.members); setScreen('member'); } catch (e) { setError((e as Error).message); } finally { setLoading(false); } };
@@ -53,7 +57,7 @@ function App() {
   const back = () => { setError(''); if (screen === 'member') setScreen('division'); else if (screen === 'session') setScreen('member'); else if (screen === 'attendance') setScreen('session'); };
 
   if (screen === 'splash') return <main className="flex min-h-screen items-center justify-center bg-gradient-to-br from-emerald-800 to-teal-600 text-white"><div className="text-center"><div className="mx-auto mb-5 flex h-20 w-20 items-center justify-center rounded-3xl bg-white/15 text-5xl font-black shadow-2xl">F</div><p className="font-semibold tracking-[0.35em]">FALAH 2026</p><p className="mt-2 text-sm text-emerald-100">Absensi Panitia</p></div></main>;
-  if (!bootstrap) return <Shell><div className="p-6"><Alert text={error || 'Menghubungkan ke server...'} /></div></Shell>;
+  if (!bootstrap) return <Shell><div className="p-6"><Alert text={error || 'Menghubungkan ke server...'} />{error && <button onClick={() => window.location.reload()} className="mt-4 rounded-xl bg-emerald-700 px-4 py-3 font-semibold text-white">Muat ulang halaman</button>}</div></Shell>;
   return <Shell onBack={screen !== 'division' ? back : undefined} onChange={member ? resetMember : undefined}><div className="p-5">
     {screen === 'division' && <><Step title="Pilih Divisi" subtitle="Pilih divisi kepanitiaan Anda untuk melanjutkan." icon={<Users />} /><div className="space-y-3">{bootstrap.divisions.map((item) => <button key={item.id} onClick={() => chooseDivision(item)} className="flex w-full items-center justify-between rounded-2xl border border-slate-200 bg-white p-4 text-left shadow-sm transition hover:border-emerald-400"><span className="font-semibold text-slate-800">{item.name}</span><ChevronRight className="text-emerald-600" size={20} /></button>)}</div></>}
     {screen === 'member' && <><Step title="Pilih Nama" subtitle={division?.name ?? ''} icon={<Users />} /><div className="space-y-3">{members.map((item) => <button key={item.id} onClick={() => chooseMember(item)} className="flex w-full items-center justify-between rounded-2xl border border-slate-200 p-4 text-left shadow-sm"><span><span className="block font-semibold text-slate-800">{item.name}</span><span className="text-xs text-slate-500">{item.publicCode}</span></span><ChevronRight className="text-emerald-600" size={20} /></button>)}</div></>}
