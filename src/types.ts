@@ -91,3 +91,18 @@ export interface GPSPosition {
   accuracy: number;
   timestamp: number;
 }
+
+export type OperationalState = 'closed' | 'checkin_open' | 'checkout_open' | 'completed';
+
+export interface PublicDivision { id: string; name: string; }
+export interface PublicMember { id: string; name: string; publicCode: string; divisionId: string; }
+export interface PublicSession {
+  id: string; sessionNumber: number; name: string; date: string; dayLabel: string;
+  agendaStartTime: string; agendaEndTime: string; checkInStartTime: string; checkInEndTime: string;
+  lateToleranceMinutes: number; checkOutStartTime: string; checkOutEndTime: string;
+  description?: string; operationalState: OperationalState;
+}
+export interface PublicAttendance {
+  id: string; sessionId: string; status: string; checkInStatus?: string; checkOutStatus?: string;
+  checkInAt?: string; checkOutAt?: string; workDurationSeconds?: number;
+}

@@ -1,344 +1,163 @@
-import express from 'express';
-import path from 'path';
-import fs from 'fs';
-import { DEFAULT_SETTINGS, DEFAULT_LOCATIONS, DEFAULT_SESSIONS, generateInitialMembers } from '../src/data/defaultData.js';
-import type { AttendanceRecord, AppSettings, CommitteeMember, LocationTarget, EventSession } from '../src/types.js';
+import express, { type Request, type Response } from 'express';
+import { requireSupabaseAdmin, supabaseAdmin } from './lib/supabaseAdmin.js';
+import { distanceMeters, isValidGps, isWithinTimeWindow, jakartaParts, lateMinutes, minutesFromTime, type RawGpsInput } from './lib/attendancePolicy.js';
 
 const app = express();
+app.use(express.json({ limit: '32kb' }));
+const eventFields = 'id,name,venue_name,timezone,status';
+const sessionFields = 'id,session_number,name,session_date,day_label,agenda_start_time,agenda_end_time,check_in_start_time,check_in_end_time,late_tolerance_minutes,check_out_start_time,check_out_end_time,description,is_active,operational_state';
 
-app.use(express.json({ limit: '10mb' }));
+const errorText = (error: unknown) => error instanceof Error ? error.message : 'Terjadi kesalahan pada server';
+const fail = (res: Response, status: number, error: string) => res.status(status).json({ error });
+const isUuid = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 
-// File storage path for durable persistence
-const DATA_DIR = path.join(process.cwd(), 'data');
-const DATA_FILE = path.join(DATA_DIR, 'attendance_store.json');
-
-// In-memory cache
-interface StoreState {
-  settings: AppSettings;
-  locations: LocationTarget[];
-  members: CommitteeMember[];
-  attendance: AttendanceRecord[];
+async function getActiveEvent() {
+  const db = requireSupabaseAdmin();
+  const { data, error } = await db.from('events').select(eventFields).eq('status', 'active').limit(1).maybeSingle();
+  if (error) throw error;
+  return data;
 }
 
-let store: StoreState = {
-  settings: DEFAULT_SETTINGS,
-  locations: DEFAULT_LOCATIONS,
-  members: generateInitialMembers(),
-  attendance: [],
-};
+const safeSession = (s: Record<string, unknown>) => ({
+  id: s.id, sessionNumber: s.session_number, name: s.name, date: s.session_date, dayLabel: s.day_label,
+  agendaStartTime: s.agenda_start_time, agendaEndTime: s.agenda_end_time, checkInStartTime: s.check_in_start_time,
+  checkInEndTime: s.check_in_end_time, lateToleranceMinutes: s.late_tolerance_minutes,
+  checkOutStartTime: s.check_out_start_time, checkOutEndTime: s.check_out_end_time,
+  description: s.description, operationalState: s.operational_state,
+});
 
-// Load saved data if exists
-function loadSavedData() {
+const safeAttendance = (r: Record<string, unknown> | null, session?: Record<string, unknown>) => r ? ({
+  id: r.id, sessionId: r.session_id, status: r.overall_status, checkInStatus: r.check_in_status,
+  checkOutStatus: r.check_out_status, checkInAt: r.check_in_at, checkOutAt: r.check_out_at,
+  workDurationSeconds: r.work_duration_seconds, sessionName: session?.name, date: session?.session_date,
+  operationalState: session?.operational_state,
+}) : null;
+
+app.get('/api/health', (_req, res) => res.json({ status: 'ok', database: !!supabaseAdmin, service: 'falah-attendance-api', time: new Date().toISOString() }));
+
+app.get('/api/public/bootstrap', async (_req, res) => {
+  let stage = 'configuration';
   try {
-    if (fs.existsSync(DATA_FILE)) {
-      const raw = fs.readFileSync(DATA_FILE, 'utf-8');
-      const parsed = JSON.parse(raw);
-      if (parsed.settings) {
-        store.settings = { ...DEFAULT_SETTINGS, ...parsed.settings };
-        // Ensure 3 sessions exist
-        if (!store.settings.sessions || !Array.isArray(store.settings.sessions) || store.settings.sessions.length === 0) {
-          store.settings.sessions = DEFAULT_SESSIONS;
-          store.settings.activeSessionId = DEFAULT_SETTINGS.activeSessionId;
-        }
-        if (!store.settings.venueName) {
-          store.settings.venueName = DEFAULT_SETTINGS.venueName;
-        }
-      }
-      if (Array.isArray(parsed.locations) && parsed.locations.length > 0) {
-        // If loaded locations are the old Darmo sample, upgrade them to UNAIR Kampus B
-        const hasDarmo = parsed.locations.some((l: LocationTarget) => l.address?.includes('Darmo') || l.name?.includes('Darmo'));
-        if (hasDarmo) {
-          store.locations = DEFAULT_LOCATIONS;
-        } else {
-          store.locations = parsed.locations;
-        }
-      } else {
-        store.locations = DEFAULT_LOCATIONS;
-      }
-      if (Array.isArray(parsed.members) && parsed.members.length > 0) store.members = parsed.members;
-      if (Array.isArray(parsed.attendance)) store.attendance = parsed.attendance;
-      console.log(`[Store] Successfully loaded persisted data (${store.members.length} members, ${store.attendance.length} attendance records)`);
-    } else {
-      saveData();
+    const db = requireSupabaseAdmin();
+    stage = 'events';
+    const event = await getActiveEvent();
+    if (!event) return fail(res, 503, 'Event aktif belum dikonfigurasi');
+    const [{ data: divisions, error: dError }, { data: sessions, error: sError }] = await Promise.all([
+      db.from('divisions').select('id,name,sort_order').eq('event_id', event.id).eq('is_active', true).order('sort_order'),
+      db.from('event_sessions').select(sessionFields).eq('event_id', event.id).eq('is_active', true).order('session_number'),
+    ]);
+    if (dError) { stage = 'divisions'; throw dError; }
+    if (sError) { stage = 'event_sessions'; throw sError; }
+    return res.json({ event: { id: event.id, name: event.name, venueName: event.venue_name, timezone: event.timezone }, divisions: (divisions ?? []).map((d) => ({ id: d.id, name: d.name })), sessions: (sessions ?? []).map(safeSession) });
+  } catch (error) {
+    const fault = error as { code?: unknown; message?: unknown } | null;
+    let message = typeof fault?.message === 'string' ? fault.message : 'Unknown server error';
+    for (const secret of [process.env.SUPABASE_SERVICE_ROLE_KEY, process.env.SUPABASE_URL, process.env.VITE_SUPABASE_URL]) {
+      if (secret) message = message.split(secret).join('[redacted]');
     }
-  } catch (err) {
-    console.error('[Store] Error loading store file, initializing defaults:', err);
+    message = message.replace(/https?:\/\/\S+|Bearer\s+\S+|eyJ[\w.-]+|sb_secret_[\w-]+/gi, '[redacted]');
+    console.error('[FALAH bootstrap]', {
+      stage, code: typeof fault?.code === 'string' && /^[A-Z0-9_]{1,32}$/.test(fault.code) ? fault.code : undefined,
+      message: message.slice(0, 500),
+      configuration: { urlPresent: !!(process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL), serviceRoleKeyPresent: !!process.env.SUPABASE_SERVICE_ROLE_KEY },
+    });
+    return res.status(503).json({ error: 'Gagal memuat data FALAH. Silakan muat ulang halaman.' });
   }
-}
+});
 
-function saveData() {
+app.get('/api/public/members', async (req, res) => {
+  const divisionId = req.query.divisionId;
+  if (!isUuid(divisionId)) return fail(res, 400, 'Divisi tidak valid');
   try {
-    if (!fs.existsSync(DATA_DIR)) {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
-    }
-    fs.writeFileSync(DATA_FILE, JSON.stringify(store, null, 2), 'utf-8');
-  } catch (err) {
-    console.error('[Store] Error saving store file:', err);
-  }
+    const db = requireSupabaseAdmin(); const event = await getActiveEvent();
+    if (!event) return fail(res, 503, 'Event aktif belum dikonfigurasi');
+    const { data, error } = await db.from('committee_members').select('id,name,public_code,division_id').eq('event_id', event.id).eq('division_id', divisionId).eq('is_active', true).order('name');
+    if (error) throw error;
+    return res.json({ members: (data ?? []).map((m) => ({ id: m.id, name: m.name, publicCode: m.public_code, divisionId: m.division_id })) });
+  } catch (error) { return res.status(503).json({ error: errorText(error) }); }
+});
+
+app.get('/api/public/attendance-state', async (req, res) => {
+  const memberId = req.query.memberId;
+  if (!isUuid(memberId)) return fail(res, 400, 'Panitia tidak valid');
+  try {
+    const db = requireSupabaseAdmin(); const event = await getActiveEvent();
+    if (!event) return fail(res, 503, 'Event aktif belum dikonfigurasi');
+    const { data: member, error: mError } = await db.from('committee_members').select('id,name,division_id').eq('id', memberId).eq('event_id', event.id).eq('is_active', true).maybeSingle();
+    if (mError) throw mError; if (!member) return fail(res, 404, 'Data panitia tidak ditemukan');
+    const [{ data, error }, { data: sessions, error: sessionsError }] = await Promise.all([
+      db.from('attendance_records').select('id,session_id,overall_status,check_in_status,check_out_status,check_in_at,check_out_at,work_duration_seconds').eq('event_id', event.id).eq('member_id', memberId),
+      db.from('event_sessions').select(sessionFields).eq('event_id', event.id).eq('is_active', true).order('session_number'),
+    ]);
+    if (error) throw error; if (sessionsError) throw sessionsError;
+    const sessionMap = new Map((sessions ?? []).map((item) => [item.id, item]));
+    return res.json({ member: { id: member.id, name: member.name, divisionId: member.division_id }, attendance: (data ?? []).map((record) => safeAttendance(record, sessionMap.get(record.session_id))) });
+  } catch (error) { return res.status(503).json({ error: errorText(error) }); }
+});
+
+type Context = { event: Record<string, any>; member: Record<string, any>; session: Record<string, any>; locations: Record<string, any>[] } | { error: string };
+async function getContext(memberId: string, sessionId: string): Promise<Context> {
+  const db = requireSupabaseAdmin(); const event = await getActiveEvent();
+  if (!event) return { error: 'Event aktif belum dikonfigurasi' };
+  const [{ data: member, error: mError }, { data: session, error: sError }] = await Promise.all([
+    db.from('committee_members').select('id,name,division_id,is_active').eq('id', memberId).eq('event_id', event.id).eq('is_active', true).maybeSingle(),
+    db.from('event_sessions').select(sessionFields).eq('id', sessionId).eq('event_id', event.id).eq('is_active', true).maybeSingle(),
+  ]);
+  if (mError) throw mError; if (sError) throw sError;
+  if (!member) return { error: 'Data panitia tidak ditemukan' }; if (!session) return { error: 'Sesi tidak ditemukan' };
+  const { data: mappings, error: mapError } = await db.from('session_locations').select('location_id').eq('session_id', session.id);
+  if (mapError) throw mapError;
+  const locationIds = (mappings ?? []).map((mapping) => mapping.location_id);
+  if (!locationIds.length) return { error: 'Lokasi sesi belum dikonfigurasi oleh admin' };
+  const { data: locations, error: lError } = await db.from('locations').select('id,latitude,longitude,radius_meters,max_gps_accuracy_meters,is_active').in('id', locationIds).eq('event_id', event.id).eq('is_active', true);
+  if (lError) throw lError; if (!locations?.length) return { error: 'Lokasi sesi tidak tersedia' };
+  return { event, member, session, locations };
 }
 
-loadSavedData();
+function gpsFromBody(body: Record<string, unknown>): RawGpsInput | null {
+  const gps = { latitude: Number(body.latitude), longitude: Number(body.longitude), accuracy: Number(body.accuracy) };
+  return isValidGps(gps) ? gps : null;
+}
 
-// ==================== API ROUTES ====================
-
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', time: new Date().toISOString() });
-});
-
-// Full state sync
-app.get('/api/data', (req, res) => {
-  res.json({
-    settings: store.settings,
-    locations: store.locations,
-    members: store.members,
-    attendance: store.attendance,
-  });
-});
-
-// Check-in
-app.post('/api/attendance/check-in', (req, res) => {
-  const {
-    memberId,
-    date,
-    sessionId,
-    sessionName,
-    checkInTime,
-    checkInStatus,
-    locationId,
-    locationName,
-    latitude,
-    longitude,
-    distanceMeters,
-    insideRadius,
-    notes,
-    photo,
-  } = req.body;
-
-  const member = store.members.find((m) => m.id === memberId);
-  if (!member) {
-    return res.status(404).json({ error: 'Data panitia tidak ditemukan' });
-  }
-
-  // Check if already checked in for this session (or date)
-  let record = store.attendance.find((a) => {
-    if (a.memberId !== memberId) return false;
-    if (sessionId && a.sessionId) {
-      return a.sessionId === sessionId;
+async function mutate(action: 'checkin' | 'checkout', req: Request, res: Response) {
+  const body = req.body as Record<string, unknown>; const memberId = body.memberId; const sessionId = body.sessionId;
+  if (!isUuid(memberId) || !isUuid(sessionId)) return fail(res, 400, 'Panitia dan sesi wajib dipilih');
+  const gps = gpsFromBody(body); if (!gps) return fail(res, 422, 'Lokasi GPS tidak valid. Silakan refresh lokasi dan coba lagi.');
+  try {
+    const db = requireSupabaseAdmin(); const context = await getContext(memberId, sessionId);
+    if ('error' in context) return fail(res, 409, context.error);
+    const { event, session, locations } = context; const wantedState = action === 'checkin' ? 'checkin_open' : 'checkout_open';
+    if (session.operational_state !== wantedState) return fail(res, 409, action === 'checkin' ? 'Check-in belum dibuka untuk sesi ini.' : 'Check-out belum dibuka untuk sesi ini.');
+    const now = new Date(); const local = jakartaParts(now);
+    if (local.date !== session.session_date) return fail(res, 409, 'Sesi ini belum aktif pada tanggal operasionalnya.');
+    if (action === 'checkin' && minutesFromTime(local.time) < minutesFromTime(session.check_in_start_time)) return fail(res, 409, 'Check-in belum masuk waktu yang ditentukan.');
+    if (action === 'checkout' && !isWithinTimeWindow(local.time, session.check_out_start_time, session.check_out_end_time)) return fail(res, 409, 'Check-out belum masuk atau sudah melewati waktu yang ditentukan.');
+    const maxAccuracy = Math.min(...locations.map((location) => Number(location.max_gps_accuracy_meters ?? 100)));
+    if (gps.accuracy > maxAccuracy) return fail(res, 422, 'Akurasi lokasi belum cukup baik. Refresh lokasi dan coba lagi.');
+    const nearest = locations.map((location) => ({ location, distance: distanceMeters(gps.latitude, gps.longitude, Number(location.latitude), Number(location.longitude)) })).sort((a, b) => a.distance - b.distance)[0];
+    if (!nearest || nearest.distance > Number(nearest.location.radius_meters)) return fail(res, 403, 'Anda berada di luar radius lokasi absensi.');
+    const location = nearest.location; const distance = nearest.distance;
+    const { data: existing, error: eError } = await db.from('attendance_records').select('*').eq('event_id', event.id).eq('session_id', session.id).eq('member_id', memberId).maybeSingle();
+    if (eError) throw eError;
+    if (action === 'checkin') {
+      if (existing?.check_in_at) return fail(res, 409, 'Panitia sudah melakukan check-in untuk sesi ini.');
+      const late = lateMinutes(local.time, session.check_in_end_time, session.late_tolerance_minutes) > 0;
+      const record = { event_id: event.id, session_id: session.id, member_id: memberId, overall_status: late ? 'late' : 'present', check_in_status: late ? 'late' : 'on_time', check_in_at: now.toISOString(), check_in_location_id: location.id, check_in_latitude: gps.latitude, check_in_longitude: gps.longitude, check_in_accuracy_meters: gps.accuracy, check_in_distance_meters: Math.round(distance * 100) / 100, check_in_inside_radius: true, check_in_notes: typeof body.notes === 'string' ? body.notes.slice(0, 500) : null, source: 'public' };
+      const { data, error } = await db.from('attendance_records').insert(record).select('id,session_id,overall_status,check_in_status,check_in_at').single();
+      if (error) { if (error.code === '23505') return fail(res, 409, 'Panitia sudah melakukan check-in untuk sesi ini.'); throw error; }
+      return res.status(201).json({ success: true, attendance: safeAttendance(data, session), lateMinutes: lateMinutes(local.time, session.check_in_end_time, session.late_tolerance_minutes) });
     }
-    return a.date === date;
-  });
+    if (!existing?.check_in_at) return fail(res, 409, 'Check-in wajib dilakukan sebelum check-out.'); if (existing.check_out_at) return fail(res, 409, 'Panitia sudah melakukan check-out untuk sesi ini.');
+    const duration = Math.max(0, Math.floor((now.getTime() - new Date(existing.check_in_at).getTime()) / 1000));
+    const { data, error } = await db.from('attendance_records').update({ check_out_status: 'valid', check_out_at: now.toISOString(), check_out_location_id: location.id, check_out_latitude: gps.latitude, check_out_longitude: gps.longitude, check_out_accuracy_meters: gps.accuracy, check_out_distance_meters: Math.round(distance * 100) / 100, check_out_inside_radius: true, check_out_notes: typeof body.notes === 'string' ? body.notes.slice(0, 500) : null, work_duration_seconds: duration, updated_at: now.toISOString() }).eq('id', existing.id).is('check_out_at', null).select('id,session_id,overall_status,check_in_status,check_out_status,check_in_at,check_out_at,work_duration_seconds').maybeSingle();
+    if (error) throw error; if (!data) return fail(res, 409, 'Check-out sudah diproses atau data berubah.');
+    return res.json({ success: true, attendance: safeAttendance(data, session) });
+  } catch (error) { return res.status(503).json({ error: errorText(error) }); }
+}
 
-  if (record && record.checkInTime) {
-    return res.status(400).json({ error: `Panitia sudah melakukan check-in untuk sesi ${record.sessionName || 'ini'}` });
-  }
-
-  if (!record) {
-    record = {
-      id: `att-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
-      memberId: member.id,
-      memberName: member.name,
-      division: member.division,
-      role: member.role,
-      sessionId: sessionId || store.settings.activeSessionId,
-      sessionName: sessionName || (store.settings.sessions?.find(s => s.id === sessionId)?.name || 'Sesi Falah'),
-      date: date || new Date().toISOString().split('T')[0],
-      createdAt: Date.now(),
-    };
-    store.attendance.unshift(record);
-  }
-
-  record.sessionId = sessionId || record.sessionId || store.settings.activeSessionId;
-  record.sessionName = sessionName || record.sessionName || (store.settings.sessions?.find(s => s.id === record?.sessionId)?.name);
-  record.checkInTime = checkInTime;
-  record.checkInStatus = checkInStatus || 'Tepat Waktu';
-  record.checkInLocationId = locationId;
-  record.checkInLocationName = locationName;
-  record.checkInLatitude = latitude;
-  record.checkInLongitude = longitude;
-  record.checkInDistanceMeters = distanceMeters;
-  record.checkInInsideRadius = insideRadius;
-  record.checkInNotes = notes || '';
-  if (photo) record.checkInPhoto = photo;
-
-  saveData();
-  res.json({ success: true, record });
-});
-
-// Check-out
-app.post('/api/attendance/check-out', (req, res) => {
-  const {
-    memberId,
-    date,
-    sessionId,
-    checkOutTime,
-    locationId,
-    locationName,
-    latitude,
-    longitude,
-    distanceMeters,
-    insideRadius,
-    notes,
-    workDurationFormatted,
-  } = req.body;
-
-  const record = store.attendance.find((a) => {
-    if (a.memberId !== memberId) return false;
-    if (sessionId && a.sessionId) {
-      return a.sessionId === sessionId;
-    }
-    return a.date === date;
-  });
-
-  if (!record) {
-    return res.status(400).json({ error: 'Belum ada data check-in untuk panitia pada sesi ini' });
-  }
-
-  record.checkOutTime = checkOutTime;
-  record.checkOutLocationId = locationId;
-  record.checkOutLocationName = locationName;
-  record.checkOutLatitude = latitude;
-  record.checkOutLongitude = longitude;
-  record.checkOutDistanceMeters = distanceMeters;
-  record.checkOutInsideRadius = insideRadius;
-  record.checkOutNotes = notes || '';
-  if (workDurationFormatted) {
-    record.workDurationFormatted = workDurationFormatted;
-  }
-
-  saveData();
-  res.json({ success: true, record });
-});
-
-// Admin manual entry / edit
-app.post('/api/attendance/manual', (req, res) => {
-  const { memberId, date, sessionId, sessionName, checkInTime, checkOutTime, checkInStatus, notes } = req.body;
-  const member = store.members.find((m) => m.id === memberId);
-  if (!member) {
-    return res.status(404).json({ error: 'Panitia tidak ditemukan' });
-  }
-
-  let record = store.attendance.find((a) => {
-    if (a.memberId !== memberId) return false;
-    if (sessionId && a.sessionId) {
-      return a.sessionId === sessionId;
-    }
-    return a.date === date;
-  });
-
-  if (!record) {
-    record = {
-      id: `att-manual-${Date.now()}`,
-      memberId: member.id,
-      memberName: member.name,
-      division: member.division,
-      role: member.role,
-      sessionId: sessionId || store.settings.activeSessionId,
-      sessionName: sessionName || (store.settings.sessions?.find(s => s.id === sessionId)?.name || 'Sesi Falah'),
-      date: date,
-      createdAt: Date.now(),
-    };
-    store.attendance.unshift(record);
-  }
-
-  if (sessionId) record.sessionId = sessionId;
-  if (sessionName) record.sessionName = sessionName;
-
-  if (checkInTime) {
-    record.checkInTime = checkInTime;
-    record.checkInStatus = checkInStatus || 'Tepat Waktu';
-    record.checkInInsideRadius = true;
-    record.checkInLocationName = 'Verifikasi Admin (Manual)';
-  }
-  if (checkOutTime) {
-    record.checkOutTime = checkOutTime;
-    record.checkOutInsideRadius = true;
-    record.checkOutLocationName = 'Verifikasi Admin (Manual)';
-  }
-  if (notes) {
-    record.checkInNotes = (record.checkInNotes ? record.checkInNotes + ' | ' : '') + notes;
-  }
-
-  saveData();
-  res.json({ success: true, record });
-});
-
-// Delete attendance record
-app.delete('/api/attendance/:id', (req, res) => {
-  const { id } = req.params;
-  store.attendance = store.attendance.filter((a) => a.id !== id);
-  saveData();
-  res.json({ success: true });
-});
-
-// Settings update
-app.put('/api/settings', (req, res) => {
-  store.settings = { ...store.settings, ...req.body };
-  saveData();
-  res.json({ success: true, settings: store.settings });
-});
-
-// Locations CRUD
-app.post('/api/locations', (req, res) => {
-  const newLoc: LocationTarget = {
-    id: `loc-${Date.now()}`,
-    name: req.body.name || 'Titik Lokasi Baru',
-    address: req.body.address || '',
-    latitude: Number(req.body.latitude),
-    longitude: Number(req.body.longitude),
-    radiusMeters: Number(req.body.radiusMeters) || 100,
-    isActive: req.body.isActive !== false,
-  };
-  store.locations.push(newLoc);
-  saveData();
-  res.json({ success: true, location: newLoc });
-});
-
-app.put('/api/locations/:id', (req, res) => {
-  const { id } = req.params;
-  const index = store.locations.findIndex((l) => l.id === id);
-  if (index === -1) {
-    return res.status(404).json({ error: 'Lokasi tidak ditemukan' });
-  }
-  store.locations[index] = { ...store.locations[index], ...req.body };
-  saveData();
-  res.json({ success: true, location: store.locations[index] });
-});
-
-app.delete('/api/locations/:id', (req, res) => {
-  const { id } = req.params;
-  store.locations = store.locations.filter((l) => l.id !== id);
-  saveData();
-  res.json({ success: true });
-});
-
-// Member registration / addition
-app.post('/api/members', (req, res) => {
-  const { name, division, role, phone } = req.body;
-  if (!name || !division) {
-    return res.status(400).json({ error: 'Nama dan Divisi wajib diisi' });
-  }
-  const newMember: CommitteeMember = {
-    id: `FLH-${String(store.members.length + 1).padStart(3, '0')}`,
-    name,
-    division,
-    role: role || 'Anggota',
-    phone: phone || '',
-  };
-  store.members.push(newMember);
-  saveData();
-  res.json({ success: true, member: newMember });
-});
-
-// Reset data back to defaults
-app.post('/api/reset-data', (req, res) => {
-  store = {
-    settings: DEFAULT_SETTINGS,
-    locations: DEFAULT_LOCATIONS,
-    members: generateInitialMembers(),
-    attendance: [],
-  };
-  saveData();
-  res.json({ success: true });
-});
+app.post('/api/public/attendance/check-in', (req, res) => mutate('checkin', req, res));
+app.post('/api/public/attendance/check-out', (req, res) => mutate('checkout', req, res));
+app.all('/api/data', (_req, res) => fail(res, 410, 'Endpoint lama tidak tersedia.'));
+app.all(['/api/attendance/*', '/api/settings', '/api/locations*', '/api/members', '/api/reset-data'], (_req, res) => fail(res, 403, 'Akses admin belum tersedia pada endpoint publik.'));
 
 export default app;

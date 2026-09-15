@@ -1,11 +1,13 @@
-import { createClient } from '@supabase/supabase-js';
+import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 
 const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
 const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-export const supabaseAdmin =
-  supabaseUrl && serviceRoleKey
-    ? createClient(supabaseUrl, serviceRoleKey, {
-        auth: { autoRefreshToken: false, persistSession: false },
-      })
-    : null;
+export const supabaseAdmin: SupabaseClient | null = supabaseUrl && serviceRoleKey
+  ? createClient(supabaseUrl, serviceRoleKey, { auth: { autoRefreshToken: false, persistSession: false } })
+  : null;
+
+export function requireSupabaseAdmin(): SupabaseClient {
+  if (!supabaseAdmin) throw new Error('Supabase server configuration is missing');
+  return supabaseAdmin;
+}
