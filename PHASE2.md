@@ -1,16 +1,18 @@
 # Phase 2 — Secure Attendance API
 
-This branch moves public attendance writes from local JSON storage to Supabase.
+This branch moves public attendance from local JSON storage to Supabase.
 
 ## Server-authoritative rules
 
-- The browser supplies only member/session identity plus GPS coordinates and optional notes.
+- The browser supplies only member/session identity plus GPS coordinates, accuracy, and optional notes.
 - Server time in `Asia/Jakarta` determines the attendance date and time.
-- The server validates the member and session belong to the same active event.
-- The server resolves the allowed geofence from `session_locations` and computes Haversine distance itself.
-- Check-in/check-out windows are enforced server-side.
-- Duplicate attendance is prevented by the database unique constraint `(event_id, session_id, member_id)`.
-- Public `/api/data` does not return NIM, phone numbers, attendance records, admin credentials, or geofence coordinates.
+- The server validates that the member and session belong to the same active event.
+- The server resolves the verified geofence from `session_locations` and computes Haversine distance itself.
+- The server enforces operational state (`closed`, `checkin_open`, `checkout_open`, `completed`), date, and time eligibility.
+- Duplicate attendance is prevented by `(event_id, session_id, member_id)`.
+- Public data is split across `/api/public/bootstrap`, `/api/public/members`, and `/api/public/attendance-state`.
+- Legacy `/api/data` returns HTTP 410 and never exposes a full store.
+- Public responses do not return NIM, phone numbers, raw GPS, venue coordinates, radii, attendance tables, or admin credentials.
 - Legacy admin mutation endpoints are disabled until Phase 3 Supabase Auth is implemented.
 
 ## Required Vercel server environment
@@ -18,4 +20,6 @@ This branch moves public attendance writes from local JSON storage to Supabase.
 - `SUPABASE_URL`
 - `SUPABASE_SERVICE_ROLE_KEY` (server only; never expose as a `VITE_` variable)
 
-The current frontend still needs a small compatibility update to send browser GPS `accuracy` and restore the selected member's attendance via `/api/attendance/status` after refresh. Do not promote this branch to production until those items and the Vercel environment variables are complete.
+The live database is authoritative for the current roster and venue configuration. The repository `supabase/seed.sql` is prototype-only and must never be run against production.
+
+All sessions are initialized conservatively as `closed`; only the future authenticated Committee Chair admin flow may open them.
